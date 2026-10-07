@@ -15,6 +15,14 @@ omarchy plugin add https://github.com/Nejcc/omarchy-disk-reclaim.git
 omarchy plugin enable nejcc.disk-reclaim
 ```
 
+## Uninstall
+
+```sh
+omarchy plugin remove nejcc.disk-reclaim
+```
+
+Nothing is left behind.
+
 ## Usage
 
 The bar shows a disk icon and the free space on `/`. Under 10% free it turns
