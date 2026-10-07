@@ -3,6 +3,8 @@
 Free space on `/` in the bar, and one panel that lists what you can clean on
 an Arch/Omarchy box, biggest first, each with its size and a Clean button.
 
+![Preview](preview.png)
+
 Freeing space on Arch means remembering a dozen commands: `paccache`,
 `yay -Sc`, `journalctl --vacuum-size`, `pacman -Rns $(pacman -Qdtq)`, emptying
 the trash, `docker system prune`. This puts them in one place and shows what
