@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Disk Reclaim helper.
+#
+#   disk-reclaim scan --json   read-only sizes per category, as JSON
+#   disk-reclaim clean <id>    preview, confirm and clean one category (run in a terminal)
+#   disk-reclaim launch <id>   open `clean <id>` in a floating terminal, return when it closes
+#
+# The scan never changes anything and never needs root. Cleaning only happens
+# in a visible terminal, where sudo and pacman ask their own questions.
+set -uo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}
+TRASH_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/Trash
+TIMEOUT=${DISK_RECLAIM_TIMEOUT:-8}
+JOURNAL_KEEP=100M
+CACHE_AGE_DAYS=30
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- Parsers: command output on stdin, bytes (or a count) on stdout ----
+
+# One awk function for every size format the tools print: pacman "6.47 MiB",
+# journalctl "32M", docker "1.2GB" (decimal), plain "0B".
+AWK_BYTES='
+function bytes(s,   n, u, p, m) {
+  gsub(/^[ \t]+|[ \t]+$/, "", s)
+  if (!match(s, /^[0-9]+(\.[0-9]+)?/)) return 0
+  n = substr(s, 1, RLENGTH) + 0
+  u = substr(s, RLENGTH + 1); gsub(/[ \t]/, "", u)
+  p = u == "" ? 1 : index("BKMGTPE", toupper(substr(u, 1, 1)))
+  if (p == 0) return 0
+  m = (length(u) == 2 && toupper(substr(u, 2, 1)) == "B") ? 1000 : 1024
+  return n * m ^ (p - 1)
+}'
+
+to_bytes() { awk "$AWK_BYTES"' { printf "%.0f\n", bytes($0) }' <<<"$1"; }
+
+# `paccache -dk2`: "==> finished dry run: 3 candidates (disk space saved: 1.23 GiB)"
+parse_paccache() {
+  awk "$AWK_BYTES"' /disk space saved:/ { sub(/.*disk space saved:/, ""); sub(/\).*/, ""); t = bytes($0) }
+    END { printf "%.0f\n", t }'
+}
+
+# `journalctl --disk-usage`: "Archived and active journals take up 32M in the file system."
+parse_journal() {
+  awk "$AWK_BYTES"' /take up/ { sub(/.*take up /, ""); sub(/ in the file system.*/, ""); t = bytes($0) }
+    END { printf "%.0f\n", t }'
+}
+
+# `LC_ALL=C pacman -Qi <pkgs>`: sum of "Installed Size  : 6.47 MiB"
+parse_pacman_installed() {
+  awk "$AWK_BYTES"' /^Installed Size/ { sub(/^[^:]*:/, ""); t += bytes($0) }
+    END { printf "%.0f\n", t }'
+}
+
+# `docker system df --format "{{.Type}}\t{{.Reclaimable}}"`: "Images\t1.2GB (45%)".
+# Volumes are left out: `docker system prune -a` does not touch them.
+parse_docker() {
+  awk -F'\t' "$AWK_BYTES"' $1 !~ /Volume/ { split($2, r, " "); t += bytes(r[1]) }
+    END { printf "%.0f\n", t }'
+}
+
+# `snapper --csvout --no-headers -a list --columns config,number`: snapshot 0 is
+# the live system, not a snapshot.
+parse_snapper() {
+  awk -F, 'NF >= 2 && $2 + 0 > 0 { n++ } END { print n + 0 }'
+}
+
+# `du -sb <dir>`: first field, 0 when du printed nothing (timeout, missing dir).
+parse_du() { awk 'NR == 1 { t = $1 } END { print t + 0 }'; }
+
+# ---- Read-only probes ----
+
+slow() { timeout "$TIMEOUT" nice -n 19 ionice -c3 "$@" 2>/dev/null; }
+dir_size() { if [[ -d $1 ]]; then slow du -sbx "${@:2}" "$1" | parse_du; else echo 0; fi; }
+pkg_cache_dir() { (have pacman-conf && pacman-conf CacheDir 2>/dev/null | head -1) || true; }
+
+# category <id> <name> <size> <reclaim> <cleanable> <detail> <description>
+category() {
+  local sep=","
+  [[ $first == 1 ]] && sep="" && first=0
+  printf '%s\n  {"id":"%s","name":"%s","size":%s,"reclaim":%s,"cleanable":%s,"detail":"%s","description":"%s"}' \
+    "$sep" "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+
+scan() {
+  first=1
+  printf '['
+
+  if have pacman; then
+    local dir size reclaim
+    dir=$(pkg_cache_dir)
+    dir=${dir:-/var/cache/pacman/pkg}
+    size=$(dir_size "$dir")
+    if have paccache; then
+      reclaim=$(slow paccache -dk2 | parse_paccache)
+      category pacman "Pacman cache" "$size" "${reclaim:-0}" true "keeps the 2 newest versions" \
+        "Old package versions in ${dir%/}. Keeps the two newest of each, so a downgrade is still possible."
+    else
+      category pacman "Pacman cache" "$size" "$size" true "up to, install pacman-contrib for exact" \
+        "Package files in ${dir%/} for packages that are no longer installed (pacman -Sc)."
+    fi
+
+    local orphans count=0 osize=0
+    orphans=$(pacman -Qdtq 2>/dev/null)
+    if [[ -n $orphans ]]; then
+      count=$(wc -l <<<"$orphans")
+      # shellcheck disable=SC2086 # one package name per word
+      osize=$(LC_ALL=C pacman -Qi $orphans 2>/dev/null | parse_pacman_installed)
+    fi
+    category orphans "Orphan packages" "$osize" "$osize" "$([[ $count -gt 0 ]] && echo true || echo false)" \
+      "$count packages" "Packages installed as dependencies that nothing needs any more. pacman lists them and asks before removing."
+  fi
+
+  local helper size
+  for helper in yay paru; do
+    [[ -d $CACHE_DIR/$helper ]] || continue
+    size=$(dir_size "$CACHE_DIR/$helper")
+    category "$helper" "${helper^} build cache" "$size" "$size" "$(have "$helper" && echo true || echo false)" \
+      "${CACHE_DIR/#$HOME/\~}/$helper" "AUR sources and built packages. $helper asks which parts to remove."
+  done
+
+  if have journalctl; then
+    local jsize keep
+    jsize=$(slow journalctl --disk-usage | parse_journal)
+    keep=$(to_bytes "$JOURNAL_KEEP")
+    category journal "Systemd journal" "${jsize:-0}" "$((jsize > keep ? jsize - keep : 0))" true \
+      "vacuum to $JOURNAL_KEEP" "Old system logs. Archived journal files are removed until $JOURNAL_KEEP remain."
+  fi
+
+  if [[ -d $TRASH_DIR ]]; then
+    size=$(dir_size "$TRASH_DIR")
+    category trash "Trash" "$size" "$size" true "${TRASH_DIR/#$HOME/\~}" \
+      "Everything in the trash of your home folder, for good."
+  fi
+
+  if [[ -d $CACHE_DIR ]]; then
+    local old
+    size=$(dir_size "$CACHE_DIR" --exclude="$CACHE_DIR/yay" --exclude="$CACHE_DIR/paru")
+    old=$(slow find "$CACHE_DIR" -xdev -type f -mtime +"$CACHE_AGE_DAYS" \
+      -not -path "$CACHE_DIR/yay/*" -not -path "$CACHE_DIR/paru/*" -printf '%s\n' |
+      awk '{ t += $1 } END { printf "%.0f\n", t }')
+    category cache "User cache" "$size" "${old:-0}" true "files untouched for $CACHE_AGE_DAYS+ days" \
+      "Files in ${CACHE_DIR/#$HOME/\~} not modified in $CACHE_AGE_DAYS days. Apps rebuild what they need."
+  fi
+
+  # Only when the daemon answers without sudo; a socket that needs root is skipped.
+  if have docker && timeout 3 docker info >/dev/null 2>&1; then
+    local dreclaim
+    dreclaim=$(slow docker system df --format '{{.Type}}\t{{.Reclaimable}}' | parse_docker)
+    category docker "Docker" "${dreclaim:-0}" "${dreclaim:-0}" true "unused images, containers, build cache" \
+      "Stopped containers, unused networks, images no container uses and build cache. Volumes are kept."
+  fi
+
+  # Count only: snapshot space needs root and btrfs quotas to measure.
+  if have snapper; then
+    local snaps
+    if snaps=$(timeout 5 snapper --csvout --no-headers -a list --columns config,number 2>/dev/null); then
+      category snapper "Snapper snapshots" 0 -1 false "$(parse_snapper <<<"$snaps") snapshots" \
+        "Btrfs snapshots. Manage them with snapper or Limine's boot menu; this plugin only counts them."
+    fi
+  fi
+
+  printf '\n]\n'
+}
+
+# ---- Cleaning: runs in the terminal the user is looking at ----
+
+confirm() {
+  local reply
+  read -rp "$1 [y/N] " reply </dev/tty
+  [[ $reply == [yY]* ]]
+}
+
+run() {
+  printf '\n\033[1m$ %s\033[0m\n' "$*"
+  "$@"
+}
+
+clean() {
+  local dir
+  case "${1:-}" in
+  pacman)
+    dir=$(pkg_cache_dir)
+    dir=${dir:-/var/cache/pacman/pkg}
+    if have paccache; then
+      echo "Package files that would be removed from ${dir%/}:"
+      paccache -dk2 -v
+      confirm "Remove them?" && run sudo paccache -rk2
+    else
+      run sudo pacman -Sc
+    fi
+    ;;
+  orphans)
+    local orphans
+    orphans=$(pacman -Qdtq)
+    [[ -n $orphans ]] || {
+      echo "No orphan packages."
+      return 0
+    }
+    # shellcheck disable=SC2086 # one package name per word; pacman asks before removing
+    run sudo pacman -Rns $orphans
+    ;;
+  yay | paru)
+    have "$1" || {
+      echo "$1 is not installed."
+      return 1
+    }
+    run "$1" -Sc --aur
+    ;;
+  journal)
+    journalctl --disk-usage
+    confirm "Vacuum the journal down to $JOURNAL_KEEP?" && run sudo journalctl --vacuum-size="$JOURNAL_KEEP"
+    ;;
+  trash)
+    du -sh "$TRASH_DIR" 2>/dev/null
+    find "$TRASH_DIR/info" -maxdepth 1 -name '*.trashinfo' 2>/dev/null | wc -l | xargs printf '%s items\n'
+    confirm "Empty the trash for good?" && run rm -rf "$TRASH_DIR/files" "$TRASH_DIR/info" "$TRASH_DIR/expunged"
+    ;;
+  cache)
+    echo "Biggest folders in $CACHE_DIR:"
+    du -sh "$CACHE_DIR"/* 2>/dev/null | sort -h | tail -10
+    confirm "Delete files there not modified in $CACHE_AGE_DAYS days (yay/paru excluded)?" &&
+      run find "$CACHE_DIR" -xdev -type f -mtime +"$CACHE_AGE_DAYS" \
+        -not -path "$CACHE_DIR/yay/*" -not -path "$CACHE_DIR/paru/*" -delete
+    ;;
+  docker)
+    docker system df
+    run docker system prune -a
+    ;;
+  *)
+    echo "Unknown category: ${1:-}" >&2
+    return 2
+    ;;
+  esac
+}
+
+launch() {
+  [[ -n ${1:-} ]] || return 2
+  have omarchy-launch-floating-terminal-with-presentation || {
+    echo "omarchy-launch-floating-terminal-with-presentation not found" >&2
+    return 127
+  }
+  local marker
+  marker=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/disk-reclaim.XXXXXX")
+  # The EXIT trap also fires when the window is closed mid-run (SIGHUP).
+  omarchy-launch-floating-terminal-with-presentation \
+    "trap 'touch $(printf %q "$marker")' EXIT; bash $(printf %q "$SELF") clean $(printf %q "$1")" >/dev/null 2>&1 || return
+  # The launcher may return before the terminal closes, so wait for the trap.
+  # ponytail: 1s poll only while a clean is open; capped at 1h in case the terminal never started.
+  for ((i = 0; i < 3600; i++)); do
+    [[ -e $marker ]] && break
+    sleep 1
+  done
+  rm -f "$marker"
+}
+
+main() {
+  case "${1:-}" in
+  scan) scan ;;
+  clean) clean "${2:-}" ;;
+  launch) launch "${2:-}" ;;
+  *)
+    echo "usage: disk-reclaim scan --json | clean <id> | launch <id>" >&2
+    return 2
+    ;;
+  esac
+}
+
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"

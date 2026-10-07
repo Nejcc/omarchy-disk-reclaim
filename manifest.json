@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "nejcc.disk-reclaim",
+  "name": "Disk Reclaim",
+  "version": "0.1.0",
+  "author": "Nejcc",
+  "license": "MIT",
+  "description": "Free space on / in the bar, and one panel with the pacman and AUR caches, journal, orphans, trash, ~/.cache and Docker, each with its size and a Clean button",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Disk Reclaim",
+    "description": "Free space on / with a panel of what can be cleaned",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "warnPercent": 10 },
+    "schema": [
+      {
+        "key": "warnPercent",
+        "type": "integer",
+        "label": "Warn below (% free)",
+        "min": 1,
+        "max": 50,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "The disk icon turns the urgent color when free space on / drops under this."
+      }
+    ]
+  }
+}
